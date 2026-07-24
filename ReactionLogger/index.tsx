@@ -1,7 +1,7 @@
 import definePlugin, { OptionType } from "@utils/types";
 import { definePluginSettings } from "@api/Settings";
 import * as DataStore from "@api/DataStore";
-import { FluxDispatcher, Toasts, UserStore, Menu, React } from "@webpack/common";
+import { FluxDispatcher, UserStore, Menu, React } from "@webpack/common";
 import { addContextMenuPatch, removeContextMenuPatch } from "@api/ContextMenu";
 import { addMessageAccessory, removeMessageAccessory } from "@api/MessageAccessories";
 import { openModal, ModalRoot, ModalHeader, ModalContent, ModalCloseButton, ModalSize } from "@utils/modal";
@@ -21,6 +21,8 @@ interface ReactionLog {
 const STORAGE_KEY = "reaction-logger";
 
 let logCache: ReactionLog[] | null = null;
+let isSaving = false;
+const saveQueue: any[] = [];
 
 async function getLogs(): Promise<ReactionLog[]> {
     if (!logCache) {
@@ -53,10 +55,6 @@ export const settings = definePluginSettings({
                 onClick={async () => {
                     logCache = [];
                     await DataStore.set(STORAGE_KEY, []);
-                    Toasts.show({
-                        message: "Reaction logs cleared!",
-                        type: Toasts.Type.SUCCESS
-                    });
                 }}
             >
                 Clear All Reaction Logs
@@ -73,9 +71,11 @@ function getMaxLogs(): number {
     }
 }
 
-async function saveReaction(payload: any) {
-    if (!payload?.messageId || !payload?.userId || !payload?.emoji) return;
+async function processQueue() {
+    if (isSaving || saveQueue.length === 0) return;
+    isSaving = true;
 
+    const payload = saveQueue.shift();
     const logs = await getLogs();
 
     const newEntry: ReactionLog = {
@@ -98,6 +98,17 @@ async function saveReaction(payload: any) {
     }
 
     await DataStore.set(STORAGE_KEY, logs);
+    isSaving = false;
+
+    if (saveQueue.length > 0) {
+        processQueue();
+    }
+}
+
+function saveReaction(payload: any) {
+    if (!payload?.messageId || !payload?.userId || !payload?.emoji) return;
+    saveQueue.push(payload);
+    processQueue();
 }
 
 function getUnicodeEmojiUrl(emoji: string) {
@@ -213,16 +224,15 @@ function ReactionHistoryModal({
     );
 }
 
-// Determines if there are historical logs for this message that differ from the live state
 function hasUnmatchedReactions(message: any, logs: ReactionLog[]): boolean {
     const msgLogs = logs.filter(l => l.messageId === message.id);
     if (msgLogs.length === 0) return false;
 
-    // Check if there are any removal logs at all
     const hasRemovals = msgLogs.some(l => l.type === "MESSAGE_REACTION_REMOVE");
     if (hasRemovals) return true;
 
-    // Build net active count per emoji from logs
+    if (!message.reactions || !Array.isArray(message.reactions)) return false;
+
     const loggedCounts = new Map<string, number>();
     for (const log of msgLogs) {
         const key = log.emoji.id ? `${log.emoji.name}:${log.emoji.id}` : log.emoji.name;
@@ -234,22 +244,14 @@ function hasUnmatchedReactions(message: any, logs: ReactionLog[]): boolean {
         }
     }
 
-    // Build visible counts from live Discord message
     const visibleCounts = new Map<string, number>();
-    if (Array.isArray(message.reactions)) {
-        for (const react of message.reactions) {
-            const key = react.emoji.id ? `${react.emoji.name}:${react.emoji.id}` : react.emoji.name;
-            visibleCounts.set(key, react.count ?? 0);
-        }
+    for (const react of message.reactions) {
+        const key = react.emoji.id ? `${react.emoji.name}:${react.emoji.id}` : react.emoji.name;
+        visibleCounts.set(key, react.count ?? 0);
     }
 
-    // Check for mismatched counts between log state and visible live state
     for (const [key, count] of loggedCounts.entries()) {
         if ((visibleCounts.get(key) ?? 0) !== count) return true;
-    }
-
-    for (const [key, count] of visibleCounts.entries()) {
-        if ((loggedCounts.get(key) ?? 0) !== count) return true;
     }
 
     return false;
