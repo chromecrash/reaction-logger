@@ -1,10 +1,10 @@
 import definePlugin, { OptionType } from "@utils/types";
 import { definePluginSettings } from "@api/Settings";
 import * as DataStore from "@api/DataStore";
-import { FluxDispatcher, UserStore, Menu, React } from "@webpack/common";
+import { FluxDispatcher, Modal, openModal, UserStore, Menu, React } from "@webpack/common";
 import { addContextMenuPatch, removeContextMenuPatch } from "@api/ContextMenu";
 import { addMessageAccessory, removeMessageAccessory } from "@api/MessageAccessories";
-import { openModal, ModalRoot, ModalHeader, ModalContent, ModalCloseButton, ModalSize } from "@utils/modal";
+import { findByProps } from "@webpack";
 
 interface ReactionLog {
     type: "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_REMOVE";
@@ -23,6 +23,9 @@ const STORAGE_KEY = "reaction-logger";
 let logCache: ReactionLog[] | null = null;
 let isSaving = false;
 const saveQueue: any[] = [];
+
+// Discord Webpack module for fetching uncached users
+const UserUtils = findByProps("fetchProfile", "getUser", "fetchUser");
 
 async function getLogs(): Promise<ReactionLog[]> {
     if (!logCache) {
@@ -90,14 +93,27 @@ async function processQueue() {
         timestamp: Date.now()
     };
 
-    logs.push(newEntry);
+    // Deduplicate: ignore if identical reaction event was logged within the last 2 seconds
+    const isDuplicate = logs.some(log => 
+        log.type === newEntry.type &&
+        log.messageId === newEntry.messageId &&
+        log.userId === newEntry.userId &&
+        log.emoji.id === newEntry.emoji.id &&
+        log.emoji.name === newEntry.emoji.name &&
+        Math.abs(log.timestamp - newEntry.timestamp) < 2000
+    );
 
-    const max = getMaxLogs();
-    if (logs.length > max) {
-        logs.splice(0, logs.length - max);
+    if (!isDuplicate) {
+        logs.push(newEntry);
+
+        const max = getMaxLogs();
+        if (logs.length > max) {
+            logs.splice(0, logs.length - max);
+        }
+
+        await DataStore.set(STORAGE_KEY, logs);
     }
 
-    await DataStore.set(STORAGE_KEY, logs);
     isSaving = false;
 
     if (saveQueue.length > 0) {
@@ -139,6 +155,56 @@ function ReactionEmoji({ emoji }: { emoji: ReactionLog["emoji"] }) {
     );
 }
 
+function ReactionUserLabel({ userId }: { userId: string }) {
+    const [user, setUser] = React.useState(() => UserStore.getUser(userId));
+    const [loading, setLoading] = React.useState(!user);
+
+    React.useEffect(() => {
+        let isMounted = true;
+
+        if (!user) {
+            const cachedUser = UserStore.getUser(userId);
+            if (cachedUser) {
+                setUser(cachedUser);
+                setLoading(false);
+            } else if (UserUtils?.fetchUser) {
+                UserUtils.fetchUser(userId)
+                    .then((fetchedUser: any) => {
+                        if (isMounted && fetchedUser) {
+                            setUser(fetchedUser);
+                        }
+                    })
+                    .catch(() => {})
+                    .finally(() => {
+                        if (isMounted) setLoading(false);
+                    });
+            } else {
+                setLoading(false);
+            }
+        }
+
+        return () => {
+            isMounted = false;
+        };
+    }, [userId, user]);
+
+    const getUserDisplayName = () => {
+        if (user) {
+            return user.globalName || user.username;
+        }
+        if (loading) {
+            return "Loading user...";
+        }
+        return `Unknown User (${userId})`;
+    };
+
+    return (
+        <span style={{ color: "#f2f3f5", fontWeight: 600, fontSize: "14px" }}>
+            {getUserDisplayName()}
+        </span>
+    );
+}
+
 function ReactionHistoryModal({
     messageId,
     onClose,
@@ -160,24 +226,14 @@ function ReactionHistoryModal({
     }, [messageId]);
 
     return (
-        <ModalRoot transitionState={transitionState} size={ModalSize.MEDIUM}>
-            <ModalHeader separator={false}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%" }}>
-                    <h3 style={{ margin: 0, fontSize: "18px", fontWeight: 600, color: "#f2f3f5" }}>
-                        Reaction History
-                    </h3>
-                    <ModalCloseButton onClick={onClose} />
-                </div>
-            </ModalHeader>
-
-            <ModalContent style={{ padding: "16px", display: "flex", flexDirection: "column", gap: "8px" }}>
+        <Modal transitionState={transitionState} onClose={onClose} size="md" title="Reaction History">
+            <div style={{ padding: "16px", display: "flex", flexDirection: "column", gap: "8px" }}>
                 {logs.length === 0 ? (
                     <div style={{ color: "#949ba4", textAlign: "center", padding: "24px 0" }}>
                         No reactions logged for this message.
                     </div>
                 ) : (
                     logs.map((log, i) => {
-                        const user = UserStore.getUser(log.userId);
                         const isRemoved = log.type === "MESSAGE_REACTION_REMOVE";
 
                         return (
@@ -206,9 +262,7 @@ function ReactionHistoryModal({
                                         >
                                             {isRemoved ? "Removed" : "Added"}
                                         </span>
-                                        <span style={{ color: "#f2f3f5", fontWeight: 600, fontSize: "14px" }}>
-                                            {user?.username ?? log.userId}
-                                        </span>
+                                        <ReactionUserLabel userId={log.userId} />
                                     </div>
 
                                     <small style={{ color: "#b5bac1", fontSize: "12px", marginTop: "2px" }}>
@@ -219,8 +273,8 @@ function ReactionHistoryModal({
                         );
                     })
                 )}
-            </ModalContent>
-        </ModalRoot>
+            </div>
+        </Modal>
     );
 }
 
@@ -316,7 +370,7 @@ function messageContextPatch(children: any[], props: any) {
 export default definePlugin({
     name: "ReactionLogger",
     description: "Logs reaction history per message and indicates non-visible changes",
-    authors: [{ name: "pfew", id: "931645562246275093" }],
+    authors: [{ name: "pfew", id: 931645562246275093n }],
     settings,
 
     start() {
